@@ -92,7 +92,8 @@ class AppRepository internal constructor(context: Context, databaseName: String)
 
     suspend fun addDrafts(collectionId: String, cards: List<CardRecord>) {
         cards.forEach(::validateCard)
-        val batch = UUID.randomUUID().toString()
+        // Drafts sort by batch ID; a zero-padded time prefix keeps review batches in scan order.
+        val batch = System.currentTimeMillis().toString().padStart(13, '0') + "-" + UUID.randomUUID()
         mutate { db ->
             requireCollection(db, collectionId)
             cards.forEachIndexed { index, card ->
@@ -242,10 +243,45 @@ private fun putDraft(db: SQLiteDatabase, record: DraftRecord) = upsert(db, "draf
 private fun isDeletedCommit(db: SQLiteDatabase, id: String): Boolean =
     db.query("drafts", arrayOf("id"), "committed_card_id = ?", arrayOf(id), null, null, null).use { it.moveToFirst() }
 
+private const val PRICECHARTING = "PriceCharting"
+
+/**
+ * Applies an owned-card edit without letting links or estimates for a different printing survive.
+ * Values changed in the same update (a newly pasted product link, a catalog match, a typed or freshly
+ * retrieved estimate) already describe the new identity and are kept. Condition does not select a
+ * source product or price column, so it never invalidates them. A grade change alone re-selects the
+ * saved source column for the new grade, because the linked product is still the same printing.
+ */
 internal fun invalidateChangedIdentity(old: CardRecord?, updated: CardRecord): CardRecord {
     if (old == null) return updated
-    fun identity(card: CardRecord) = listOf(card.name, card.setName, card.number, card.catalogId, card.finish, card.grade, card.condition)
-    if (identity(old) == identity(updated)) return updated
-    return updated.copy(tcgplayerUrl = "", pricechartingUrl = "", priceCents = null,
-        priceSource = "", priceUpdatedAt = null, priceBasis = "Ungraded", priceQuotes = emptyList())
+    fun printing(card: CardRecord) = listOf(card.name, card.setName, card.number, card.catalogId, card.finish)
+    val printingChanged = printing(old) != printing(updated)
+    val gradeChanged = old.grade != updated.grade
+    val linkChanged = old.pricechartingUrl != updated.pricechartingUrl
+    if (!printingChanged && !gradeChanged && !linkChanged) return updated
+    fun <T> keepIfEdited(before: T, after: T, cleared: T): T = if (after != before) after else cleared
+    val result = when {
+        printingChanged -> updated.copy(
+            // A finish correction keeps the catalog printing; a name/set/number correction does not.
+            catalogId = if (listOf(old.name, old.setName, old.number) == listOf(updated.name, updated.setName, updated.number))
+                updated.catalogId else keepIfEdited(old.catalogId, updated.catalogId, ""),
+            tcgplayerUrl = keepIfEdited(old.tcgplayerUrl, updated.tcgplayerUrl, ""),
+            pricechartingUrl = keepIfEdited(old.pricechartingUrl, updated.pricechartingUrl, ""),
+            priceQuotes = keepIfEdited(old.priceQuotes, updated.priceQuotes, emptyList()),
+        )
+        linkChanged -> updated.copy(priceQuotes = keepIfEdited(old.priceQuotes, updated.priceQuotes,
+            updated.priceQuotes.filterNot { it.source == PRICECHARTING }))
+        else -> updated
+    }
+    val priceEdited = updated.priceCents != old.priceCents || updated.priceSource != old.priceSource ||
+        updated.priceUpdatedAt != old.priceUpdatedAt
+    if (priceEdited) return result
+    // Only the product link changed: a manual estimate still stands; a retrieved one described the old product.
+    if (!printingChanged && !gradeChanged && old.priceSource != PRICECHARTING) return result
+    val basis = result.grade.ifBlank { "Ungraded" }
+    val reselected = if (gradeChanged && !printingChanged && !linkChanged && old.priceSource.isNotBlank())
+        result.priceQuotes.lastOrNull { it.source == old.priceSource && it.basis == basis } else null
+    return if (reselected != null) result.copy(priceCents = reselected.cents, priceSource = reselected.source,
+        priceBasis = reselected.basis, priceUpdatedAt = reselected.updatedAt)
+    else result.copy(priceCents = null, priceSource = "", priceUpdatedAt = null, priceBasis = "Ungraded")
 }

@@ -76,6 +76,38 @@ class DomainTest {
         assertEquals("", changed.tcgplayerUrl)
     }
 
+    @Test fun gradeChangeReselectsSavedColumnAndSameEditValuesSurvive() {
+        val url = "https://www.pricecharting.com/game/pokemon-base-set/charizard-4"
+        val quotes = listOf(PriceQuote(39423, "PriceCharting", "Ungraded", 7, url), PriceQuote(2407750, "PriceCharting", "PSA 10", 7, url))
+        val card = CardRecord(name = "Charizard", setName = "Base Set", number = "4/102", finish = "Holofoil", catalogId = "base1-4",
+            pricechartingUrl = url, priceCents = 39423, priceSource = "PriceCharting", priceBasis = "Ungraded",
+            priceUpdatedAt = 7, priceQuotes = quotes)
+        val graded = invalidateChangedIdentity(card, card.copy(grade = "PSA 10"))
+        assertEquals(2407750L, graded.priceCents)
+        assertEquals("PSA 10", graded.priceBasis)
+        assertEquals(url, graded.pricechartingUrl)
+        val missingColumn = invalidateChangedIdentity(card, card.copy(grade = "Grade 9"))
+        assertNull(missingColumn.priceCents)
+        assertEquals(url, missingColumn.pricechartingUrl)
+        assertEquals(quotes, missingColumn.priceQuotes)
+        assertEquals(card.copy(condition = "Near Mint"), invalidateChangedIdentity(card, card.copy(condition = "Near Mint")))
+        assertEquals("base1-4", invalidateChangedIdentity(card, card.copy(finish = "Reverse Holofoil")).catalogId)
+        val newUrl = "https://www.pricecharting.com/game/pokemon-base-set-2/charizard-4"
+        val relinked = invalidateChangedIdentity(card, card.copy(setName = "Base Set 2", pricechartingUrl = newUrl))
+        assertEquals(newUrl, relinked.pricechartingUrl)
+        assertEquals("", relinked.catalogId)
+        assertNull(relinked.priceCents)
+        assertTrue(relinked.priceQuotes.isEmpty())
+        val manual = invalidateChangedIdentity(card, card.copy(name = "Charizard ex", priceCents = 100, priceSource = "Manual", priceUpdatedAt = 9))
+        assertEquals(100L, manual.priceCents)
+        assertEquals("", manual.pricechartingUrl)
+        val linkOnly = invalidateChangedIdentity(card, card.copy(pricechartingUrl = newUrl))
+        assertNull(linkOnly.priceCents)
+        assertTrue(linkOnly.priceQuotes.isEmpty())
+        val manualCard = card.copy(priceCents = 500, priceSource = "Manual", priceQuotes = emptyList())
+        assertEquals(500L, invalidateChangedIdentity(manualCard, manualCard.copy(pricechartingUrl = newUrl)).priceCents)
+    }
+
     @Test fun backupsAreVersionedAndRejectDanglingReferencesAndDuplicateIds() {
         val collection = CollectionRecord(id = "c", name = "Binder")
         val card = CardRecord(id = "one", collectionId = "c")

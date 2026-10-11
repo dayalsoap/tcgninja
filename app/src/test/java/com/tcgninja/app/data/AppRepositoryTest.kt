@@ -72,6 +72,15 @@ class AppRepositoryTest {
         assertEquals(1, repo.cards.value.size)
     }
 
+    @Test fun newerDraftBatchesSortAfterOlderOnes() = runBlocking {
+        val repo = repository()
+        val collection = repo.createCollection("Order")
+        repo.addDrafts(collection, listOf(CardRecord(name = "First scan")))
+        Thread.sleep(5)
+        repo.addDrafts(collection, listOf(CardRecord(name = "Second scan A"), CardRecord(name = "Second scan B")))
+        assertEquals(listOf("First scan", "Second scan A", "Second scan B"), repo.drafts.value.map { it.card.name })
+    }
+
     @Test fun twoRepositoryInstancesSharePublishedState() = runBlocking {
         val name = "shared-${UUID.randomUUID()}.db"
         val a = repository(name); val b = repository(name)

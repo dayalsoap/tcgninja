@@ -93,7 +93,15 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
         val items = collectionDrafts()
         loadDraft(items.indexOfFirst { it.card.id == card.id })
     }
-    fun collectionDrafts() = drafts.value.filter { it.collectionId == collectionId }
+    /**
+     * Review navigation covers batches that still have uncommitted drafts. Fully committed batches stay
+     * stored as commit tombstones but no longer pad "Card N of M" with every card ever scanned.
+     */
+    fun collectionDrafts(): List<DraftRecord> {
+        val all = drafts.value.filter { it.collectionId == collectionId }
+        val open = all.filter { it.committedCardId == null }.map { it.batchId }.toSet()
+        return all.filter { it.batchId in open }
+    }
     fun loadDraft(index: Int) {
         val items = collectionDrafts()
         if (items.isEmpty()) { screen = "collection"; return }
@@ -138,17 +146,24 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun saveEditor() = runTask("Saving card…") {
         require(editorCard.name.isNotBlank()) { "Enter a card name before saving." }
-        validateProductUrl(editorCard.pricechartingUrl, "pricecharting.com")
         validateProductUrl(editorCard.tcgplayerUrl, "tcgplayer.com")
+        // Apply the same URL rules the price refresh uses, so a saved link can actually be priced.
+        editorCard = editorCard.copy(pricechartingUrl = editorCard.pricechartingUrl.takeIf { it.isNotBlank() }
+            ?.let { PriceChartingParser.productUrl(it).toString() }.orEmpty())
         val original = editorOriginal
         if (original != null) {
-            val changedIdentity = listOf(original.name, original.number, original.setName, original.finish, original.grade, original.condition) !=
-                listOf(editorCard.name, editorCard.number, editorCard.setName, editorCard.finish, editorCard.grade, editorCard.condition)
-            val updated = if (changedIdentity) editorCard.copy(priceCents = null, priceSource = "", priceUpdatedAt = null,
-                pricechartingUrl = "", tcgplayerUrl = "", catalogId = "", priceQuotes = emptyList()) else editorCard
-            repository.saveCard(updated)
+            // The repository drops links/estimates that no longer describe the edited printing while
+            // keeping a link, catalog match, or estimate the user supplied in this same edit.
+            repository.saveCard(editorCard)
             editorDirty = false
-            openCard(updated.id)
+            openCard(editorCard.id)
+            val saved = cards.value.find { it.id == editorCard.id }
+            if (saved != null && saved.priceCents == null && saved.pricechartingUrl.isNotBlank() &&
+                saved.pricechartingUrl != original.pricechartingUrl) {
+                try { repository.saveCard(PriceService().refresh(saved)); notice = "Card saved and estimate retrieved." }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { notice = "Card saved. Price unavailable: ${e.message.orEmpty()}".take(220) }
+            }
         } else {
             flushDraft()
             val committedId = repository.commitDraft(editorDraftId)
@@ -173,10 +188,12 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
         try {
             val recognized = RecognitionService(settings).recognize(path, extraPath, binder)
             require(recognized.isNotEmpty()) { "No cards found. You can edit the saved capture or try another photo." }
-            repository.addDrafts(collection, recognized.map { it.copy(collectionId = collection,
-                imagePath = it.imagePath.ifBlank { path }, backImagePath = it.backImagePath.ifBlank { extraPath.orEmpty() }) })
+            val added = recognized.map { it.copy(collectionId = collection,
+                imagePath = it.imagePath.ifBlank { path }, backImagePath = it.backImagePath.ifBlank { extraPath.orEmpty() }) }
+            repository.addDrafts(collection, added)
             repository.deleteDraft(placeholder.id)
-            loadDraft(collectionDrafts().indexOfFirst { it.committedCardId == null })
+            // Open this scan's first card, not whichever older uncommitted draft happens to sort first.
+            loadDraft(collectionDrafts().indexOfFirst { it.card.id == added.first().id })
         } catch (e: Exception) {
             loadDraft(collectionDrafts().indexOfFirst { it.id == placeholder.id })
             throw e
@@ -205,9 +222,16 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
         val detail = CatalogService().details(card.catalogId)
         if (catalogForEditor) {
             val current = editorCard
-            changeEditor(detail.copy(id = current.id, collectionId = current.collectionId,
+            val merged = detail.copy(id = current.id, collectionId = current.collectionId, createdAt = current.createdAt,
                 imagePath = current.imagePath.ifBlank { detail.imagePath }, backImagePath = current.backImagePath,
-                condition = current.condition, grade = current.grade, finish = current.finish, notes = current.notes + "\n" + detail.notes))
+                condition = current.condition, grade = current.grade, finish = current.finish,
+                tcgplayerUrl = detail.tcgplayerUrl.ifBlank { current.tcgplayerUrl },
+                pricechartingUrl = detail.pricechartingUrl.ifBlank { current.pricechartingUrl },
+                priceCents = current.priceCents, priceSource = current.priceSource, priceUpdatedAt = current.priceUpdatedAt,
+                priceBasis = current.priceBasis, priceQuotes = current.priceQuotes,
+                notes = listOf(current.notes, detail.notes).filter(String::isNotBlank).joinToString("\n"))
+            // Keep links/estimates only if they still describe the matched printing.
+            changeEditor(invalidateChangedIdentity(current, merged))
             flushDraft()
             screen = if (editorDraftId.isBlank()) "edit" else "review"
             catalogForEditor = false
@@ -219,25 +243,62 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshPrices(targets: List<CardRecord>) = runTask("Updating prices…") {
         var success = 0
         var failure = 0
-        val cache = mutableMapOf<String, CardRecord>()
+        var skipped = 0
+        var stopped: String? = null
+        var firstError: String? = null
+        // One request per distinct product/grade. Failures are cached too, so duplicates are not retried.
+        val results = mutableMapOf<String, Result<CardRecord>>()
+        var nextRequestAt = 0L
         for ((index, card) in targets.withIndex()) {
             currentCoroutineContext().ensureActive()
             progress = "Updating ${index + 1} of ${targets.size}…"
-            try {
-                val key = "${card.pricechartingUrl}|${card.grade}|${card.finish}|${card.name}|${card.number}|${card.setName}"
-                val quote = cache[key] ?: PriceService().refresh(card).also { cache[key] = it; delay(1100) }
-                val current = cards.value.find { it.id == card.id }
-                if (current == card) repository.saveCard(card.copy(priceCents = quote.priceCents, priceSource = quote.priceSource,
-                    priceBasis = quote.priceBasis, priceUpdatedAt = quote.priceUpdatedAt, priceQuotes = quote.priceQuotes))
-                success++
-            } catch (e: CancellationException) { throw e }
-            catch (_: Exception) { failure++ }
+            if (card.pricechartingUrl.isBlank()) { skipped++; continue }
+            val key = "${card.pricechartingUrl}|${card.grade}|${card.finish}|${card.name}|${card.number}|${card.setName}"
+            val result = results[key] ?: run {
+                // Pace every source request, including failed ones, so errors cannot become a burst.
+                val wait = nextRequestAt - System.currentTimeMillis()
+                if (wait > 0) delay(wait)
+                val fetched: Result<CardRecord> = try { Result.success(PriceService().refresh(card)) }
+                    catch (e: CancellationException) { throw e }
+                    catch (e: Exception) { Result.failure(e) }
+                nextRequestAt = System.currentTimeMillis() + 1100
+                fetched.also { results[key] = it }
+            }
+            val error = result.exceptionOrNull()
+            if (error != null) {
+                failure++
+                if (firstError == null) firstError = error.message
+                if (error is IntegrationException && error.kind == IntegrationException.Kind.RATE_LIMIT) {
+                    stopped = error.message
+                    break
+                }
+                continue
+            }
+            val refreshed = result.getOrThrow()
+            // Never overwrite a card that changed after the refresh began.
+            if (cards.value.find { it.id == card.id } != card) { skipped++; continue }
+            repository.saveCard(card.copy(priceCents = refreshed.priceCents, priceSource = refreshed.priceSource,
+                priceBasis = refreshed.priceBasis, priceUpdatedAt = refreshed.priceUpdatedAt,
+                // A cached result came from another copy; keep this card's own non-PriceCharting quotes.
+                priceQuotes = card.priceQuotes.filterNot { it.source == "PriceCharting" } +
+                    refreshed.priceQuotes.filter { it.source == "PriceCharting" }))
+            success++
         }
-        notice = "$success price(s) updated; $failure unavailable. Previous estimates retained."
+        notice = buildString {
+            append("$success price(s) updated; $failure unavailable")
+            if (skipped > 0) append("; $skipped skipped (no product link or edited)")
+            append(". Previous estimates retained.")
+            stopped?.let { append(" Stopped early: ").append(it) }
+            // A single-card refresh should say why it failed (e.g. a grade with no source column).
+            if (targets.size == 1 && stopped == null) firstError?.let { append(" ").append(it) }
+        }.take(400)
     }
     fun findPrices(card: CardRecord) {
+        if (busy) return
         priceTarget = card
-        priceReturn = screen
+        // "Search again" runs from the match screen itself. Keep the original return target, otherwise a
+        // confirmed match for a draft/editor card would be saved directly as a new owned card.
+        if (screen != "prices") priceReturn = screen
         priceCandidates = emptyList()
         screen = "prices"
         runTask("Finding PriceCharting products…") { priceCandidates = PriceService().search(card) }
@@ -248,7 +309,8 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
             changeEditor(editorCard.copy(pricechartingUrl = candidate.url, priceCents = null, priceSource = "", priceUpdatedAt = null, priceQuotes = emptyList()))
             flushDraft()
         } else {
-            val updated = target.copy(pricechartingUrl = candidate.url, priceCents = null, priceSource = "", priceUpdatedAt = null, priceQuotes = emptyList())
+            val latest = cards.value.find { it.id == target.id } ?: error("This card no longer exists.")
+            val updated = latest.copy(pricechartingUrl = candidate.url, priceCents = null, priceSource = "", priceUpdatedAt = null, priceQuotes = emptyList())
             repository.saveCard(updated)
             try { repository.saveCard(PriceService().refresh(updated)); notice = "Product linked and estimate saved." }
             catch (e: CancellationException) { throw e }
@@ -283,6 +345,7 @@ class NinjaViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
+/** TCGplayer links are reference-only; PriceCharting links are validated by PriceChartingParser.productUrl. */
 private fun validateProductUrl(value: String, domain: String) {
     if (value.isBlank()) return
     val uri = runCatching { java.net.URI(value) }.getOrNull()

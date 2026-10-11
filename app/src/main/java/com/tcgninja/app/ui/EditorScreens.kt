@@ -124,7 +124,7 @@ fun CardEditor(vm: NinjaViewModel, drafts: List<DraftRecord>) {
             item { TextButton(onClick = { vm.findPrices(c) }, enabled = c.name.isNotBlank()) { Text("Find a matching PriceCharting product") } }
             item { Text("Use the exact product page for this set, number, and finish. Prices update only on commit or when you press Update. Search links are available from the saved profile.", style = MaterialTheme.typography.bodySmall) }
             item { Field("TCGplayer product URL (optional)", c.tcgplayerUrl, { vm.changeEditor(c.copy(tcgplayerUrl = it.trim())) }) }
-            if (!review) item { Text("Changing the card name, set, number, finish, or grade clears old catalog links and estimates to avoid using a different variant's value.", style = MaterialTheme.typography.bodySmall) }
+            if (!review) item { Text("Changing the card name, set, number, or finish clears links and estimates for the old printing unless you replace them here. Changing the grade switches to that grade's saved price column.", style = MaterialTheme.typography.bodySmall) }
             item { Field("Notes / attacks / rules text", c.notes, { vm.changeEditor(c.copy(notes = it)) }, multiline = true) }
             item { Button(onClick = vm::saveEditor, enabled = c.name.isNotBlank() && priceError == null && !vm.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
                 Icon(Icons.Default.Check, null); Spacer(Modifier.width(8.dp)); Text(if (review) "Commit to collection" else "Save changes")
